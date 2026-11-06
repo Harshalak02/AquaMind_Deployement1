@@ -15,6 +15,7 @@ Ablations switch one agent off at a time (`forensic`, `skeptic`, `strategist`, `
 """
 from __future__ import annotations
 
+import os
 import numpy as np
 
 from ..search import hypotheses as hyp
@@ -118,9 +119,34 @@ class Crew:
     def __init__(self, llm, *, forensic: bool = True, skeptic: bool = True, strategist: bool = True, auditor: bool = True, slate: bool = True,
                  triangulation: bool = True, sop: bool = True, tol: float = 0.10, max_llm: int = 16, max_rounds: int = 14, max_strategist: int = 6,
                  max_forensic: int = 4, disc_min: float = 0.35, tol_disc: float = 0.20, disc_override: bool = True, hold: bool = True,
-                 hold_below: float = 0.95, calls_unexplained_only: bool = True, chance_policy: bool = True, override_ratio: float = 0.6):
+                 hold_below: float = 0.95, calls_unexplained_only: bool = True, chance_policy: bool = True, override_ratio: float = 0.6,
+                 m1_weak_leads: bool = True, m2_turn_budget: bool = True, m3_confirm_dig: bool = True,
+                 m4_ticket_type: bool = True, m5_corner_permits: bool = True):
         self.llm, self.use_forensic, self.use_skeptic, self.use_strategist = llm, forensic, skeptic, strategist
         self.use_auditor, self.use_slate, self.use_triangulation, self.use_sop = auditor, slate, triangulation, sop
+
+        # Mitigation flags (Mid-project report Section 10)
+        env_mit = os.environ.get("AGENTIX_MITIGATIONS", "").strip().lower()
+        if env_mit == "none":
+            m1_weak_leads = m2_turn_budget = m3_confirm_dig = m4_ticket_type = m5_corner_permits = False
+        elif env_mit:
+            mits = {x.strip() for x in env_mit.split(",")}
+            m1_weak_leads = "m1" in mits
+            m2_turn_budget = "m2" in mits
+            m3_confirm_dig = "m3" in mits
+            m4_ticket_type = "m4" in mits
+            m5_corner_permits = "m5" in mits
+        self.m1_weak_leads = m1_weak_leads
+        self.m2_turn_budget = m2_turn_budget
+        self.m3_confirm_dig = m3_confirm_dig
+        self.m4_ticket_type = m4_ticket_type
+        self.m5_corner_permits = m5_corner_permits
+
+        # M2: Raise Forensic's turn limit and overall LLM call budget
+        if self.m2_turn_budget:
+            max_forensic = max(max_forensic, 6)
+            max_llm = max(max_llm, 20)
+
         self.tol, self.max_llm, self.max_rounds = tol, max_llm, max_rounds
         self.max_strategist, self.n_strategist, self.max_forensic, self.n_forensic = max_strategist, 0, max_forensic, 0
         self.disc_min, self.tol_disc, self.disc_override, self.use_hold, self.hold_below = disc_min, tol_disc, disc_override, hold, hold_below
@@ -296,10 +322,19 @@ class Crew:
         tb.options = {}
         tested = {c["label"].split(":")[-1] for c in b.checks if c["kind"] == "step"}
         lit = [c["label"].split(":")[-1] for c in b.checks if c["kind"] == "step" and c.get("support") is not None]
+        if self.m1_weak_leads:
+            suggestive = []
+            for t in tb.trace:
+                if t.get("tool") == "field_check" and t.get("result", {}).get("kind") == "step test":
+                    suggestive += t["result"].get("suggestive", [])
+            sec_to_expand = list(dict.fromkeys(lit + suggestive))
+        else:
+            sec_to_expand = lit
         k = 1
-        parts = [a for sid in lit for a in secs.parts(sid) if a not in tested]
+        parts = [a for sid in sec_to_expand for a in secs.parts(sid) if a not in tested]
         if parts:
-            tb.add_option(f"M{k}", "step", {"sections": parts[:6]}, f"night step test of the parts {', '.join(parts[:6])} of the lit section"); k += 1
+            label_sec = "the lit section" if not (self.m1_weak_leads and not lit) else "section with extra flow"
+            tb.add_option(f"M{k}", "step", {"sections": parts[:6]}, f"night step test of the parts {', '.join(parts[:6])} of {label_sec}"); k += 1
         hs = [h for h in self.slate if h.kind == "network_leak" and h.region is not None and h.region.any()]
         sids = []
         for h in hs:
@@ -311,14 +346,25 @@ class Crew:
         quiet = [c["center"] for c in b.checks if "listen" in c.get("kind", "")]
         for h in hs[:3]:
             jj = np.where(h.region & (b.cand if getattr(b, "cand", None) is not None else True))[0]
-            jj = [j for j in jj if all(tb.net.pipe_distance[j, q] > 120 for q in quiet)]
-            if jj:
-                j = int(max(jj, key=lambda x: b.post[x]))
+            unquiet_jj = [j for j in jj if all(tb.net.pipe_distance[j, q] > 120 for q in quiet)]
+            if unquiet_jj:
+                j = int(max(unquiet_jj, key=lambda x: b.post[x]))
                 tb.add_option(f"M{k}", "listen", {"center": j}, f"listen within 250 m of {tb.describe_node(j)} ({h.hid})"); k += 1
+            elif self.m1_weak_leads and len(jj) > 0 and h.mass >= 0.15:
+                # M1: Allow a re-check while the area still holds much of the leak map
+                near_quiet = [q for q in quiet if any(tb.net.pipe_distance[j, q] <= 120 for j in jj)]
+                if len(near_quiet) < 2:
+                    j = int(max(jj, key=lambda x: b.post[x]))
+                    tb.add_option(f"M{k}", "listen", {"center": j}, f"listen within 250 m of {tb.describe_node(j)} ({h.hid} - re-check: area holds {h.mass:.0%} of map)"); k += 1
         # In realistic utility operations (AWWA M36), step-testing is an intrusive diagnostic
         # that requires an investigated hypothesis (sids) or a previously lit section (parts).
         # Blind exploratory shutdowns of 6 sections without any hypothesis are physically/operationally forbidden.
-        if hs:
+        has_lead = (
+            any(h.kind == "network_leak" and h.mass >= 0.15 for h in self.slate)
+            or any(m.usable() and m.eps < 0.6 for m in b.messages.values())
+            or any(c.get("support") is not None for c in b.checks)
+        )
+        if hs and not (self.m2_turn_budget and has_lead):
             mass = secs.mass(b.post)
             rest = [secs.ids[i] for i in np.argsort(-mass) if secs.ids[i] not in tested and secs.ids[i] not in sids][:2]
             if rest:
@@ -395,7 +441,8 @@ class Crew:
             if j is not None:
                 quiet = [chk["center"] for chk in tb.board.checks if "listen" in chk.get("kind", "")]
                 if any(tb.net.pipe_distance[j, q] <= 120 for q in quiet):
-                    return None
+                    if not (self.m1_weak_leads and float(tb.board.post[tb.net.pipe_distance[j] <= 250].sum()) >= 0.15):
+                        return None
                 return tb.add_option("C1", "listen", {"center": int(j)}, f"listen within 250 m of {tb.describe_node(int(j))} (Strategist's own)")
         return None
 

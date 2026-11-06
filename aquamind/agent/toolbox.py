@@ -13,12 +13,14 @@ new-measurement tool is the night step test:
 """
 from __future__ import annotations
 
+import os
 import time
 import zlib
 
 import numpy as np
 
 from ..search.planner import DIG_BAR, FINAL_BAR, Option, Planner
+from ..search.tool_models import p_hear
 
 SYM_WORDS = {"water_coming_out": "water coming out", "burst": "burst", "pooling": "water collected",
              "wet_ground": "wet ground", "sound_underground": "sound under road", "road_damage": "road damage",
