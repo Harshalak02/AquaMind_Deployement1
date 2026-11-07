@@ -553,7 +553,8 @@ class Crew:
             new = [rid for rid, m in tb.board.messages.items() if m.usable() and tb.attempts.get(rid, 0) == 0 and rid not in self.offered]
             if new:
                 self.offered |= set(new)
-                if self.use_forensic and self.n_llm < self.max_llm and self.n_forensic < self.max_forensic:
+                max_pre_field = (self.max_forensic - 2) if self.m2_turn_budget else self.max_forensic
+                if self.use_forensic and self.n_llm < self.max_llm and self.n_forensic < max_pre_field:
                     self.forensic(tb, f"new messages arrived ({', '.join(new[:4])}): ask them and update your hypotheses")
             ok, _ = tb.gate()
             if ok and not self.refused:
@@ -601,16 +602,36 @@ class Crew:
             vfail = bool(last.get("valve_failed"))
             surprise = abs(tb.board.best_dig()[1] - before[0]) > 0.15 or abs(tb.board.p_leak - before[1]) > 0.15
             outside = self._uncovered_hit(tb)
+
+            # M2: Give the Skeptic a turn after the first quiet check
+            if self.m2_turn_budget and self.use_skeptic and not self.skeptic_quiet_done and self.n_llm < self.max_llm:
+                if (last.get("kind") == "listening" and not heard) or (last.get("kind") == "step test" and not bool(last.get("clearly_lit"))):
+                    self.skeptic_quiet_done = True
+                    self.skeptic(tb, "a field check was quiet: attack the leading hypothesis given this negative physical evidence")
+                    if self.challenges and self.use_forensic and self.n_llm < self.max_llm and self.n_forensic < self.max_forensic:
+                        self.forensic(tb, "the Skeptic challenged the case after the quiet check: update your hypotheses")
+
+            weak_lead = False
+            if self.m1_weak_leads:
+                if last.get("kind") == "listening" and not heard and any(h.mass >= 0.15 for h in self.slate):
+                    weak_lead = True
+                elif bool(last.get("suggestive")):
+                    weak_lead = True
+
             if outside and self.use_forensic and self.n_llm < self.max_llm:
                 self.forensic(tb, f"a physical check found something OUTSIDE your hypotheses ({outside}): extend them")
                 continue
             blank = self.use_slate and not self.slate and not self.stance == "x"
-            rethink = lit or heard or vfail or surprise or (blank and self.n_forensic == 0)
+            rethink = lit or heard or vfail or surprise or weak_lead or (blank and self.n_forensic == 0)
             if self.use_forensic and self.n_llm < self.max_llm and self.n_forensic < self.max_forensic and rethink:
-                why = (f"a physical check LIT up section(s) {', '.join(last.get('clearly_lit', []))}: update your hypotheses to focus there" if lit else
-                       f"leak noise PINPOINTED by listening: {last.get('pinpointed', 'nearby')}" if heard else
-                       f"boundary valve FAILED in step test ({', '.join(last.get('valve_failed', []))}): note that these were NOT tested/cleared" if vfail else
-                       "the last check changed the evidence significantly: re-think your hypotheses")
+                if weak_lead and not (lit or heard or vfail or surprise):
+                    why = ("listening check was quiet (small leak detection is weak) but area still holds mass: re-think your hypotheses and consider adjacent sections" if last.get("kind") == "listening" else
+                           f"step test showed suggestive weak extra flow in {', '.join(last.get('suggestive', []))}: update your hypotheses to focus there")
+                else:
+                    why = (f"a physical check LIT up section(s) {', '.join(last.get('clearly_lit', []))}: update your hypotheses to focus there" if lit else
+                           f"leak noise PINPOINTED by listening: {last.get('pinpointed', 'nearby')}" if heard else
+                           f"boundary valve FAILED in step test ({', '.join(last.get('valve_failed', []))}): note that these were NOT tested/cleared" if vfail else
+                           "the last check changed the evidence significantly: re-think your hypotheses")
                 self.forensic(tb, why)
         if not (tb.done or tb.env.done):
             ap.finish(tb)
