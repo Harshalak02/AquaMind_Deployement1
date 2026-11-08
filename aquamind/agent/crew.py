@@ -158,6 +158,8 @@ class Crew:
         self.slate: list[hyp.Hypothesis] = []
         self.challenges: list[dict] = []
         self.sop_actions: list[str] = []
+        self.rejected_citations: list[dict] = []
+        self.skeptic_quiet_done = False
         self.stance = "continue"
         self._view = AquaMind(None)
 
@@ -383,6 +385,10 @@ class Crew:
             if all(D[j, u] > 150 for u in used):
                 tb.add_option(f"M{k}", "listen", {"center": j}, f"listen within 250 m of {tb.describe_node(j)} ({why})"); k += 1
                 used.append(j)
+        if self.m3_confirm_dig and tb.env.checks_left() == 1:
+            j_cand, p_cand = b.best_dig()
+            if p_cand < 0.80 and not any(o.kind == "listen" and o.args.get("center") == j_cand for o in tb.options.values()):
+                tb.add_option(f"M{k}", "listen", {"center": j_cand}, f"listen within 250 m of {tb.describe_node(j_cand)} (confirm dig spot before excavation)"); k += 1
         for o in tb.options.values():                     # one honest number per option, comparable across kinds (code)
             o.label += f" | chance it finds the leak {self.chance(tb, o):.0%}"
 
@@ -518,13 +524,23 @@ class Crew:
             self.menu(tb)
         opts = tb.plan() if tb.use_planner else list(tb.options.values())
         if not opts or tb.env.checks_left() <= 0:
+            if self.m3_confirm_dig and p < tb.planner.dig_bar:
+                ob = "; ".join(str(x) for x in (d.get("objections") or []))[:200] or str(d.get("thought") or "")[:200]
+                self.held = True
+                rec["note"] = f"HOLD: Auditor objected to weak dig (P={p:.2f} < {tb.planner.dig_bar:.2f}) with no checks left; handing over to supervisor to avoid dry dig"
+                tb.close("hand_over", f"auditor objection: {ob}", force=True)
+                return "hold"
             rec["note"] = "objection ignored: no field check left"
             return "approve"
         need = str(d.get("needs") or "none").lower()
         cand = [oid for oid, o in tb.options.items() if o.kind == need] or ([] if need == "none" else list(tb.options))
         if need == "none" or not cand:
-            rec["note"] = "objection ignored: it names no concrete check"
-            return "approve"
+            if self.m3_confirm_dig and tb.env.checks_left() > 0:
+                conf_oid = tb.add_option(f"M{len(tb.options)+1}", "listen", {"center": j}, f"listen within 250 m of {tb.describe_node(j)} (Auditor confirmation)")
+                cand = [conf_oid] if conf_oid else []
+            if not cand:
+                rec["note"] = "objection ignored: it names no concrete check"
+                return "approve"
         self.delays += 1
         rec["ran"] = cand[0]
         tb.field_check(cand[0])
