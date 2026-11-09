@@ -31,7 +31,9 @@ class Toolbox:
     def __init__(self, env, case, search, reader, docs, rulebook, *, use_gate: bool = True, use_rag: bool = True,
                  use_field: bool = True, plan_samples: int = 96, use_canvass: bool = False,
                  use_planner: bool = True, min_checks_close: int = 0, auto_sop: bool = False,
-                 allow_step: bool = True):
+                 allow_step: bool = True,
+                 m1_weak_leads: bool = True, m2_turn_budget: bool = True, m3_confirm_dig: bool = True,
+                 m4_ticket_type: bool = True, m5_corner_permits: bool = True):
         self.env, self.case, self.search, self.reader = env, case, search, reader
         self.docs, self.rules = docs, rulebook
         self.net, self.places, self.sections = search.net, search.town.places, search.sections
@@ -40,6 +42,23 @@ class Toolbox:
         self.auto_sop = auto_sop                            # True: the rule book in code does the SOP paperwork; False: only what an agent asks for (read from sop.md)
         self.use_planner = use_planner                      # False: no look-ahead values at all (the rule-based dispatcher baseline)
         self.allow_step = allow_step                        # False: no night step test (the temporary flow/pressure measurement) is offered or accepted
+
+        # Mitigation flags (Mid-project report Section 10)
+        env_mit = os.environ.get("AGENTIX_MITIGATIONS", "").strip().lower()
+        if env_mit == "none":
+            m1_weak_leads = m2_turn_budget = m3_confirm_dig = m4_ticket_type = m5_corner_permits = False
+        elif env_mit:
+            mits = {x.strip() for x in env_mit.split(",")}
+            m1_weak_leads = "m1" in mits
+            m2_turn_budget = "m2" in mits
+            m3_confirm_dig = "m3" in mits
+            m4_ticket_type = "m4" in mits
+            m5_corner_permits = "m5" in mits
+        self.m1_weak_leads = m1_weak_leads
+        self.m2_turn_budget = m2_turn_budget
+        self.m3_confirm_dig = m3_confirm_dig
+        self.m4_ticket_type = m4_ticket_type
+        self.m5_corner_permits = m5_corner_permits
         self.trace: list[dict] = []
         t0 = time.time()
         self.reads = reader.read_many(case.reports)
@@ -119,6 +138,11 @@ class Toolbox:
         b.touch()
         return 0.5 * float(np.abs(b.post - p0).sum())
 
+    @staticmethod
+    def is_false_alarm_ticket(text: str) -> bool:
+        """True if the ticket describes a non-utility cause / false alarm, False if it is a real utility repair."""
+        return ("No utility pipe leak found" in text) or ("customer-side issue" in text)
+
     def records_near(self, rid: str, k: int = 2) -> list:
         """Complaint/repair records at the place of a message (RAG)."""
         if not self.use_rag:
@@ -132,6 +156,8 @@ class Toolbox:
         out = []
         for c, s in hits:
             if any(n.lower() in c.text.lower() for n in names):         # tickets that mention the place; an agent judges what they mean
+                if self.m4_ticket_type and not self.is_false_alarm_ticket(c.text):
+                    continue
                 out.append(c)
         return out[:k + 1]
 
@@ -248,6 +274,8 @@ class Toolbox:
         c = self.docs.by_id.get(record_id) if self.use_rag else None
         if c is None or c.provenance != "record":
             return False, "unknown record id"
+        if self.m4_ticket_type and not self.is_false_alarm_ticket(c.text):
+            return False, f"{record_id} is a utility repair ticket, not a non-utility false alarm"
         m = self.board.messages.get(rid)
         if m is None or m.w is None or m.eps is None:
             return False, "the record's place is not where this message points"
@@ -295,6 +323,8 @@ class Toolbox:
         out = []
         for cid, c in self.docs.by_id.items():
             if c.provenance != "record" or "No utility pipe leak found" in c.text or cid in self.repairs_used:
+                continue
+            if self.m4_ticket_type and self.is_false_alarm_ticket(c.text):
                 continue
             w = self._record_footprint(c.text)
             if w is None:
@@ -389,8 +419,12 @@ class Toolbox:
             if r.get("ok"):
                 at = self.net.index[r["pinpointed_at"]] if r.get("heard") else None
                 self.board.add_listen_result(f"listen@{self.net.junctions[c]}", c, 250.0, r["heard"], at)
+                p_hear_est = round(p_hear(self.board.q_hat), 2)
                 r = {"ok": True, "kind": "listening", "where": self.describe_node(c), "heard": r["heard"],
-                     **({"pinpointed": self.describe_node(at)} if at is not None else {})}
+                     **({"pinpointed": self.describe_node(at)} if at is not None else {}),
+                     **({"detection_power": f"{p_hear_est:.0%}",
+                         "strength": f"quiet (detection power was {p_hear_est:.0%} for estimated leak size {self.board.q_hat:.1f} L/s; small leaks can easily go unheard)"}
+                        if (self.m1_weak_leads and not r["heard"]) else {})}
         self._promote_physical()
         self.refresh()
         r["p_success_now"] = round(self.board.best_dig()[1], 2)
@@ -400,17 +434,24 @@ class Toolbox:
         """What an auditor needs to apply the SOP to a dig at junction j: where and when it would happen, which schools and hospitals are near
         (facts of the map), and the SOP clauses retrieved from sop.md (RAG). Code states facts and text; deciding what applies is the agent's job."""
         when = self.env.clock()
-        st = self.places.node_street(j)
         lms = []
         for p in self.places.places.values():
             if p["type"] == "landmark" and p.get("subtype") in ("school", "hospital"):
                 d = float(np.hypot(*(self.net.xy[j] - self.net.xy[self.net.index[p["geometry"]["node"]]])))
                 if d <= 250:
                     lms.append(f"{p['name']} ({p['subtype']}, {d:.0f} m away)")
-        lines = [f"DIG SITE: {self.describe_node(j)}; street: {st['name'] if st else 'unknown'}; the dig would start {when.strftime('%A %H:%M')} (case clock)",
+        if self.m5_corner_permits and hasattr(self.places, "node_streets"):
+            sts = [s["name"] for s in self.places.node_streets(j)]
+            st_text = f"streets: {', '.join(sts)}" if sts else (f"street: {st['name']}" if (st := self.places.node_street(j)) else "street: unknown")
+            st_query = " ".join(sts) if sts else ((st := self.places.node_street(j)) and st["name"] or "")
+        else:
+            st = self.places.node_street(j)
+            st_text = f"street: {st['name'] if st else 'unknown'}"
+            st_query = st["name"] if st else ""
+        lines = [f"DIG SITE: {self.describe_node(j)}; {st_text}; the dig would start {when.strftime('%A %H:%M')} (case clock)",
                  "SCHOOLS / HOSPITALS within 250 m: " + ("; ".join(lms) if lms else "none")]
         if self.use_rag:
-            q = f"excavation dig {st['name'] if st else ''} school hospital resurfaced road permit weekday schools notify citizens approval"
+            q = f"excavation dig {st_query} school hospital resurfaced road permit weekday schools notify citizens approval"
             lines += ["SOP CLAUSES (retrieved from sop.md):"] + [f"  {c.id}: {c.text[:420]}" for c, _ in self.docs.search(q, k=6, provenance="policy")]
         return lines
 

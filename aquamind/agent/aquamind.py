@@ -122,7 +122,7 @@ class AquaMind:
             if m.usable() and rid not in tb.records_used:
                 recs += [f"  near {rid}: {c.id} {c.text[:150]}" for c in tb.records_near(rid) if tb._record_check(rid, c.id)[0]]
         if recs:
-            lines += ["RECORDS at message places (past tickets; a repair is NOT a false alarm - cite one only if it shows a repeat NON-utility cause):"] + recs[:4]
+            lines += ["PAST NON-UTILITY FALSE ALARMS at message places (cite only in 'records'; real repairs are in REPAIR HISTORY below):"] + recs[:4]
         reps = tb.repair_tickets_near()
         if reps:
             lines += ["REPAIR HISTORY near the complaints and hypotheses (town archive, RAG; judge yourself what a ticket says about the pipe):"]
