@@ -33,10 +33,14 @@ class PlaceIndex:
         self.alias_keys = sorted(self.alias_map, key=len, reverse=True)     # longest first
         self._node_cache: dict[str, np.ndarray] = {}
         self._street_by_node: dict[str, dict] = {}
+        self._streets_by_node: dict[str, list[dict]] = {}
         for p in self.places.values():
             if p["type"] == "street":
                 for n in p["geometry"].get("nodes", []):
                     self._street_by_node.setdefault(n, p)
+                    sts = self._streets_by_node.setdefault(n, [])
+                    if p["place_id"] not in {x["place_id"] for x in sts}:
+                        sts.append(p)
         self.landmarks = [p for p in self.places.values() if p["type"] == "landmark"]
         self._lm_xy = np.array([net.xy[net.index[p["geometry"]["node"]]] for p in self.landmarks])
 
@@ -107,8 +111,14 @@ class PlaceIndex:
         return sum(self.place_nodes(i) for i in ids) / len(ids)     # an ambiguous name -> mixture of all matches
 
     # ------------------------------------------------------------------ junction -> names
-    def node_street(self, j: int) -> dict | None:
-        return self._street_by_node.get(self.net.junctions[j])
+    def node_street(self, j: int | str) -> dict | None:
+        nid = self.net.junctions[j] if isinstance(j, int) else j
+        return self._street_by_node.get(nid)
+
+    def node_streets(self, j: int | str) -> list[dict]:
+        """All streets meeting at junction j (M5: enables corner permits where two streets meet)."""
+        nid = self.net.junctions[j] if isinstance(j, int) else j
+        return list(self._streets_by_node.get(nid, []))
 
     def node_landmark(self, j: int, max_m: float = 150.0) -> dict | None:
         d = np.hypot(*(self._lm_xy - self.net.xy[j]).T)

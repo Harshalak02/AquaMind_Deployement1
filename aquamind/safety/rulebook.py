@@ -24,10 +24,12 @@ class RuleBook:
         self.hospitals = {p["name"]: net.index[p["geometry"]["node"]] for p in lms if p.get("subtype") == "hospital"}
         resurfaced = {s.lower() for s in self.cfg["procedure"]["resurfaced_permit"]["streets"]}
         self.resurfaced_street = {}
+        self.resurfaced_streets = {}
         for p in places.places.values():
             if p["type"] == "street" and p["name"].lower() in resurfaced:
                 for n in p["geometry"]["nodes"]:
                     self.resurfaced_street[n] = p["name"]
+                    self.resurfaced_streets.setdefault(n, []).append(p["name"])
 
     def _d(self, a: int, b: int) -> float:
         return float(np.hypot(*(self.net.xy[a] - self.net.xy[b])))
@@ -40,8 +42,10 @@ class RuleBook:
             h = when.hour + when.minute / 60
             if any(self._d(idx[0], s) <= p["radius_m"] for s in self.schools) and when.weekday() < 5 and 7.5 <= h < 16.5:
                 need.append({"rule": "school_hours", "sop": "SOP-5", "do": "dig after school hours"})
-            st = self.resurfaced_street.get(nodes[0])
-            if st:
+            sts = list(dict.fromkeys(self.resurfaced_streets.get(nodes[0], [])))
+            if not sts and self.resurfaced_street.get(nodes[0]):
+                sts = [self.resurfaced_street[nodes[0]]]
+            for st in sts:
                 need.append({"rule": "resurfaced_permit", "sop": "SOP-6", "do": f"request a permit for {st}",
                              "street": st})
         r = self.cfg["procedure"]["hospital_notice"]["radius_m"]
