@@ -6,3 +6,6 @@ networkx
 pyyaml
 jsonschema
 wntr
+six
+matplotlib
+setuptools
