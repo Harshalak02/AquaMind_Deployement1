@@ -26,6 +26,33 @@ COOLDOWN_S = 45
 
 st.set_page_config(page_title="AquaMind agent", page_icon="💧", layout="wide")
 
+INP_DIR = ROOT / "data" / "raw" / "ltown"
+INP_URL = os.environ.get("LTOWN_URL", "https://huggingface.co/datasets/HarshalIITH/aquamind-ltown/resolve/main/L-TOWN_inp.zip")
+
+
+@st.cache_resource(show_spinner="First start: downloading the town network files (about 170 MB)...")
+def ensure_network_files():
+    """The two .inp files are too big for git; fetch them once from INP_URL (a zip holding exactly these two files)."""
+    import urllib.request
+    import zipfile
+    need = ("L-TOWN.inp", "L-TOWN_Real.inp")
+    if all((INP_DIR / n).exists() for n in need):
+        return True
+    INP_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp()) / "ltown.zip"
+    urllib.request.urlretrieve(INP_URL, tmp)
+    with zipfile.ZipFile(tmp) as z:
+        for n in need:                       # extract only the two expected names, flat, never trusting archive paths
+            (INP_DIR / n).write_bytes(z.read(n))
+    return True
+
+
+try:
+    ensure_network_files()
+except Exception as e:                       # show the reason instead of a crash
+    st.error(f"Could not get the network files from {INP_URL}: {e}")
+    st.stop()
+
 
 @st.cache_resource
 def shared():
@@ -101,7 +128,9 @@ if run:
                 p = subprocess.Popen([sys.executable, "-I", str(ROOT / "demo_agent" / "run_one.py"), case,
                                       f"spread_k{k}", str(out)], cwd=ROOT, stdout=subprocess.PIPE,
                                      stderr=subprocess.STDOUT, text=True)
+                tail = []
                 for line in p.stdout:
+                    tail = (tail + [line.rstrip()])[-25:]
                     st.write(f"[{int(time.time() - t0)} s] {line.strip()[:200]}")
                     status.update(label=line.strip()[:80] or "working…")
                 p.wait()
@@ -112,6 +141,7 @@ if run:
                 show(json.load(open(out)))
             else:
                 st.error("The run failed. Please try another case.")
+                st.code("\n".join(tail) or "(no output)")
         finally:
             S["last_end"] = time.time()
             S["lock"].release()
